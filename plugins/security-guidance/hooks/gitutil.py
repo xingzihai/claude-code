@@ -584,60 +584,85 @@ def _is_reviewable_source(file_path):
     return False
 
 
-def extract_file_paths_from_diff(diff_output):
-    """
-    Extract file paths from unified diff output (without content).
-    Only includes files with source code extensions.
-    Returns a list of file paths.
-    """
-    if not diff_output or not diff_output.strip():
-        return []
+def _unquote_git_path(path):
+    """Decode a C-quoted path that git emits for non-ASCII / special chars.
 
-    paths = []
-    file_diffs = diff_output.split("diff --git ")
+    With core.quotePath=true (the default), git wraps such paths in double
+    quotes and escapes bytes the C89 way (\\t, \\n, \", \\\\, and \\NNN octal
+    for the rest). A plain path is returned unchanged. Octal escapes are the
+    UTF-8 bytes of the character, so the decoded bytes are re-decoded as
+    UTF-8 to recover the real path.
+    """
+    if not (path.startswith('"') and path.endswith('"') and len(path) >= 2):
+        return path
+    inner = path[1:-1]
+    out = []
+    i = 0
+    n = len(inner)
+    while i < n:
+        c = inner[i]
+        if c == '\\' and i + 1 < n:
+            nxt = inner[i + 1]
+            if nxt in ('t', 'n', 'r'):
+                out.append({'t': '\t', 'n': '\n', 'r': '\r'}[nxt])
+                i += 2
+                continue
+            if nxt == '"':
+                out.append('"')
+                i += 2
+                continue
+            if nxt == '\\':
+                out.append('\\')
+                i += 2
+                continue
+            if nxt.isdigit() and i + 4 <= n:
+                # octal escape \NNN: one raw byte of the UTF-8 encoding
+                oct_digits = inner[i + 1:i + 4]
+                if all('0' <= d <= '7' for d in oct_digits):
+                    out.append(bytes([int(oct_digits, 8)]))
+                    i += 4
+                    continue
+            # lone backslash not followed by a recognised escape: keep as-is
+            out.append(c)
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    try:
+        return b''.join(
+            p if isinstance(p, bytes) else p.encode('utf-8') for p in out
+        ).decode('utf-8', errors='replace')
+    except Exception:
+        return path
+
+
+def _parse_diff_file_headers(diff_output):
+    """Yield (file_path, hunk_text) for each file in a unified diff.
+
+    Splits on `diff --git ` only when it starts a line — a literal occurrence
+    inside a hunk's source text (e.g. a string constant) no longer truncates
+    the following hunk. Quoted path headers (core.quotePath) are decoded.
+    """
+    file_diffs = re.split(r'(?m)^diff --git ', diff_output)
 
     for file_diff in file_diffs:
         if not file_diff.strip():
             continue
+
         lines = file_diff.split('\n')
-        header_match = re.match(r'^a/(.+?) b/(.+)$', lines[0])
-        if not header_match:
-            continue
-        file_path = header_match.group(2) or header_match.group(1) or ''
-        if not _is_reviewable_source(file_path):
-            continue
-        paths.append(file_path)
-
-    return paths
-
-
-
-def parse_diff_into_files(diff_output):
-    """
-    Parse unified diff output into a list of (file_path, diff_content) tuples.
-    Only includes files with source code extensions.
-    """
-    if not diff_output or not diff_output.strip():
-        return []
-
-    files = []
-    file_diffs = diff_output.split("diff --git ")
-
-    for file_diff in file_diffs:
-        if not file_diff.strip():
-            continue
-
-        # Extract filename from first line: "a/path/to/file b/path/to/file"
-        lines = file_diff.split('\n')
-        header_match = re.match(r'^a/(.+?) b/(.+)$', lines[0])
-        if not header_match:
-            continue
-
-        file_path = header_match.group(2) or header_match.group(1) or ''
-
-        # Filter to source code files only
-        if not _is_reviewable_source(file_path):
-            continue
+        # Two header forms: the usual `a/<path> b/<path>`, and the quoted
+        # form `"a/<path>" "b/<path>"` that git emits when core.quotePath is
+        # on and a path needs C-quoting. The regex captures the content
+        # between the quotes; re-wrap it before decoding so the C-escapes
+        # (\NNN octal for non-ASCII bytes) are resolved.
+        quoted_match = re.match(r'^"a/(.*)" "b/(.*)"$', lines[0])
+        if quoted_match:
+            file_path = _unquote_git_path('"' + quoted_match.group(2) + '"')
+        else:
+            header_match = re.match(r'^a/(.+) b/(.+)$', lines[0])
+            if not header_match:
+                continue
+            file_path = _unquote_git_path(header_match.group(2))
 
         # Extract the diff content (from first @@ onwards)
         diff_lines = []
@@ -649,9 +674,39 @@ def parse_diff_into_files(diff_output):
                 diff_lines.append(line)
 
         if diff_lines:
-            files.append((file_path, '\n'.join(diff_lines)))
+            yield file_path, '\n'.join(diff_lines)
 
-    return files
+
+def extract_file_paths_from_diff(diff_output):
+    """
+    Extract file paths from unified diff output (without content).
+    Only includes files with source code extensions.
+    Returns a list of file paths.
+    """
+    if not diff_output or not diff_output.strip():
+        return []
+
+    return [
+        file_path
+        for file_path, _ in _parse_diff_file_headers(diff_output)
+        if _is_reviewable_source(file_path)
+    ]
+
+
+
+def parse_diff_into_files(diff_output):
+    """
+    Parse unified diff output into a list of (file_path, diff_content) tuples.
+    Only includes files with source code extensions.
+    """
+    if not diff_output or not diff_output.strip():
+        return []
+
+    return [
+        (file_path, diff_content)
+        for file_path, diff_content in _parse_diff_file_headers(diff_output)
+        if _is_reviewable_source(file_path)
+    ]
 
 
 def filter_preexisting_from_diff(diff_files, cwd, baseline_sha):
